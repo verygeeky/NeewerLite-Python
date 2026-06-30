@@ -177,6 +177,8 @@ customLightPresets = defaultLightPresets[:] # copy the default presets to the li
 
 threadAction = "" # the current action to take from the thread
 serverBusy = [False, ""] # whether or not the HTTP server is busy
+neewerdClientMode = False # route commands through a running neewerd daemon (--client) instead of our own BLE
+neewerdReadVerb = "" # for --client CLI reads: "state" or "query" (else "")
 asyncioEventLoop = None # the current asyncio loop
 
 setLightUUID = "69400002-B5A3-F393-E0A9-E50E24DCCA99" # the UUID to send information to the light
@@ -3297,6 +3299,37 @@ def updateStatus(splitString = "", infinityMode = 0, customValue = None):
     return returnStatus
 
 # Use this class to store information in a format that plays nicer with Bleak > 0.19
+class NeewerdLink:
+    """Stand-in for a BleakClient when running in --client mode.
+
+    The real BLE link is held by the neewerd daemon, so this object exists only to
+    satisfy the code paths that probe a light's client object (``is_connected``,
+    ``!= ""``, disconnect-on-quit). Actual sends are translated and routed over the
+    daemon socket in writeToLight, so these methods are inert.
+    """
+    def __init__(self, mac):
+        self.mac = mac
+
+    @property
+    def is_connected(self):
+        return True
+
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return True
+
+    async def write_gatt_char(self, *args, **kwargs):
+        return None
+
+    async def start_notify(self, *args, **kwargs):
+        return None
+
+    async def read_gatt_char(self, *args, **kwargs):
+        return bytearray()
+
+
 class UpdatedBLEInformation:
     def __init__(self, name, address, rssi, HWMACaddr = None):
         self.name = name # the corrected name of this device (SL90 Pro)
@@ -3308,6 +3341,29 @@ class UpdatedBLEInformation:
 # FIND NEW LIGHTS
 async def findDevices(limitToDevices = None):
     global availableLights
+
+    if neewerdClientMode: # client mode: the roster comes from the daemon, not a BLE scan
+        import json as _json, neewerd_client
+        try:
+            snapshot = _json.loads(neewerd_client.send_line(neewerd_client.default_socket_path(), "state"))
+        except Exception as e:
+            printDebugString(f"neewerd client: cannot read state ({e})")
+            snapshot = {}
+
+        knownMACs = [light[0].address.upper() for light in availableLights]
+        for mac, info in snapshot.items():
+            if mac.upper() in knownMACs:
+                continue
+            rawName = str(info.get("name", "")).split("&")[0] # strip the "&FFFFFFFF" suffix neewerd reports
+            device = UpdatedBLEInformation(getCorrectedName(rawName), mac.upper(), -40, mac.upper())
+            # Entry shape mirrors the BLE path's append: [device, client, name, lastValue,
+            # CCTrange, oldStyleFlag, onFlag, [power, channel], infinityType].
+            availableLights.append([device, NeewerdLink(mac.upper()), device.name,
+                                    [120, 135, 2, 50, 56, 50], [32, 85], False, True,
+                                    ["---", "---"], 1])
+            printDebugString(f"neewerd client: added {device.name} {mac.upper()} from daemon roster")
+
+        return "quit" if threadAction == "quit" else ""
 
     if limitToDevices == None:
         printDebugString("Searching for new lights...")
@@ -3532,6 +3588,16 @@ async def connectToLight(selectedLight, updateGUI=True):
     global availableLights
     isConnected = False # whether or not the light is connected
     returnValue = "" # the value to return to the thread (in GUI mode, a string) or True/False (in CLI mode, a boolean value)
+
+    if neewerdClientMode: # the daemon already holds the BLE link; just mark it linked
+        lightMAC = availableLights[selectedLight][0].address
+        lightIdx = returnLightIndexesFromMacAddress(lightMAC)[0]
+        availableLights[lightIdx][1] = NeewerdLink(lightMAC) # non-"" => treated as linked everywhere
+        availableLights[lightIdx][6] = True
+        if updateGUI == True:
+            mainWindow.setTheTable(["", "", "LINKED\n(neewerd)", "Linked through the neewerd daemon"], lightIdx)
+            return ""
+        return True
 
     lightName = availableLights[selectedLight][0].name # the Name of the light (for status updates)
     lightMAC = availableLights[selectedLight][0].address # the MAC address of the light (to keep track of the light even if the index number changes)
@@ -3766,6 +3832,38 @@ async def writeToLight(selectedLights=0, updateGUI=True, useGlobalValue=True):
     startTimer = time.time() # the start of the triggering
     printDebugString("Going into send mode")
 
+    if neewerdClientMode: # route the send through the daemon instead of our own BLE write
+        import neewerd_client
+
+        if updateGUI == True:
+            if selectedLights == 0:
+                selectedLights = mainWindow.selectedLights()
+        elif type(selectedLights) is int:
+            selectedLights = [selectedLights]
+
+        socketPath = neewerd_client.default_socket_path()
+        for entry in selectedLights:
+            lightIdx = int(entry)
+            lightMAC = availableLights[lightIdx][0].address
+            line = neewerd_client.command_from_sendvalue(sendValue, lightMAC) # high-level translation
+            if line is None:
+                continue
+            try:
+                reply = neewerd_client.send_line(socketPath, line)
+                printDebugString(f"neewerd <- {line}  ::  {reply}")
+                if updateGUI == True:
+                    mainWindow.setTheTable(["", "", "", f"via neewerd: {line.split(' ', 1)[1]}"], lightIdx)
+                else:
+                    returnValue = True
+            except Exception as e:
+                if updateGUI == True:
+                    mainWindow.setTheTable(["", "", "", f"neewerd error: {e}"], lightIdx)
+                else:
+                    returnValue = False
+            availableLights[lightIdx][3] = sendValue[:] # remember the last value sent
+
+        return returnValue
+
     try:
         if updateGUI == True:
             if selectedLights == 0:
@@ -3970,6 +4068,8 @@ def workerThread(_loop):
             # CHECK EACH LIGHT AGAINST THE TABLE TO SEE IF THERE ARE CONNECTION ISSUES
             for a in range(len(availableLights)):
                 if threadAction == "": # if we're not sending, then update the light info... (check this before scanning each light)
+                    if neewerdClientMode: # the daemon owns the link; nothing to poll over BLE
+                        continue
                     if availableLights[a][1] != "": # if there is a Bleak object, then check to see if it's connected
                         if not availableLights[a][1].is_connected: # the light is disconnected, but we're reporting it isn't
                             mainWindow.setTheTable(["", "", "NOT\nLINKED", "Light disconnected!"], a) # show the new status in the table
@@ -4068,6 +4168,7 @@ def processCommands(listToProcess=[]):
     # 3-17-24 - added Infinity-style effect parameters to the list after --force_instance
     acceptable_arguments = ["--light", "--mode", "--temp", "--hue", "--sat", "--bri", "--intensity",
                             "gm", "--scene", "--animation", "--list", "--on", "--off", "--force_instance",
+                            "--client", "--state", "--query",
                             "bright_min", "bright_max", "temp_min", "temp_max", "hue_min", "hue_max",
                             "speed", "sparks", "specialOptions"]
 
@@ -4095,6 +4196,12 @@ def processCommands(listToProcess=[]):
     for a in range(len(listToProcess)):
         if listToProcess[a].find("--silent") != -1:
             listToProcess[a] = "--silent"
+        elif listToProcess[a].find("--client") != -1:
+            listToProcess[a] = "--client"
+        elif listToProcess[a].find("--state") != -1:
+            listToProcess[a] = "--state"
+        elif listToProcess[a].find("--query") != -1:
+            listToProcess[a] = "--query"
         elif listToProcess[a].find("--cli") != -1:
             listToProcess[a] = "--cli"
         elif listToProcess[a].find("--html") != -1:
@@ -4122,6 +4229,9 @@ def processCommands(listToProcess=[]):
     parser.add_argument("--silent", action="store_false", help="Don't show any debug information in the console")
     parser.add_argument("--cli", action="store_false", help="Don't show the GUI at all, just send command to one light and quit")
     parser.add_argument("--force_instance", action="store_false", help="Force a new instance of NeewerLite-Python if another one is already running")
+    parser.add_argument("--client", action="store_true", help="Route commands through a running neewerd daemon over its Unix socket instead of opening our own BLE link (see NEEWERD.md)")
+    parser.add_argument("--state", action="store_true", help="(with --client) read the daemon's cached state snapshot instead of setting anything")
+    parser.add_argument("--query", action="store_true", help="(with --client) ask the daemon to refresh battery/state/version from the tubes")
 
     # HTML SERVER SPECIFIC PARAMETERS
     if inStartupMode == False:
@@ -4155,6 +4265,10 @@ def processCommands(listToProcess=[]):
     parser.add_argument("--specialoptions", "--specialOptions", default="1", help="[DEFAULT: 1] (Infinity light SCENE mode) Special options for the current scene")
 
     args = parser.parse_args(listToProcess)
+
+    global neewerdClientMode, neewerdReadVerb
+    neewerdClientMode = args.client # route through neewerd's socket instead of our own BLE
+    neewerdReadVerb = "state" if args.state else ("query" if args.query else "") # --client read verbs
 
     if args.force_instance == False: # if this value is True, then don't do anything
         global anotherInstance
@@ -4802,6 +4916,60 @@ if __name__ == '__main__':
     if len(sys.argv) > 1: # if we have more than 1 argument on the command line (the script itself is argument 1), then process switches
         cmdReturn = processCommands()
         printDebug = cmdReturn[1] # if we use the --quiet option, then don't show debug strings in the console
+
+        # neewerd CLI client mode (--cli --client): route the one-shot command through
+        # a running neewerd daemon over its Unix socket rather than opening our own BLE
+        # link (only one BLE central can hold a light at a time). The GUI form of
+        # --client is handled in the normal launch path below (findDevices /
+        # connectToLight / writeToLight have daemon-backed branches). See NEEWERD.md.
+        if neewerdClientMode and cmdReturn[0] == False:
+            import socket
+            import neewerd_client
+
+            socketPath = neewerd_client.default_socket_path()
+
+            # Read verbs (--state / --query) just send that verb with an optional target.
+            if neewerdReadVerb != "":
+                target = cmdReturn[2].strip()
+                line = neewerdReadVerb + ("" if (target == "" or target.lower() == "all") else " " + target.upper())
+                try:
+                    reply = neewerd_client.send_line(socketPath, line)
+                    if neewerdReadVerb == "state": # pretty-print the JSON snapshot
+                        import json as _json
+                        try:
+                            reply = _json.dumps(_json.loads(reply), indent=2, sort_keys=True)
+                        except ValueError:
+                            pass
+                    print(reply)
+                except (ConnectionRefusedError, FileNotFoundError) as cliErr:
+                    print(f"NeewerLite-Python: cannot reach neewerd at {socketPath} ({cliErr}). Is neewerd running?")
+                    singleInstanceUnlockandQuit(1)
+                except socket.timeout:
+                    print("NeewerLite-Python: timed out waiting for neewerd's reply")
+                    singleInstanceUnlockandQuit(1)
+                singleInstanceUnlockandQuit(0)
+
+            # --cli --client: translate the parsed command and send it to the daemon.
+            # A multi-MAC --light list fans out to one command per tube; ALL/empty -> "all".
+            rawLight = cmdReturn[2].strip()
+            if rawLight == "" or rawLight.lower() == "all":
+                targets = ["all"]
+            else:
+                targets = [m.strip() for m in rawLight.upper().split(",") if m.strip()]
+
+            try:
+                for oneTarget in targets:
+                    line = neewerd_client.command_from_cmdreturn(cmdReturn, target=oneTarget)
+                    print(f"-> neewerd: {line}")
+                    print(neewerd_client.send_line(socketPath, line))
+            except (ConnectionRefusedError, FileNotFoundError) as cliErr:
+                print(f"NeewerLite-Python: cannot reach neewerd at {socketPath} ({cliErr}). Is neewerd running?")
+                singleInstanceUnlockandQuit(1)
+            except socket.timeout:
+                print("NeewerLite-Python: timed out waiting for neewerd's reply")
+                singleInstanceUnlockandQuit(1)
+
+            singleInstanceUnlockandQuit(0) # delete the lock file and quit out
 
         if cmdReturn[0] == False: # if we're trying to load the CLI, make sure we aren't already running another version of it
             doAnotherInstanceCheck() # check to see if another instance is running, and if it is, then error out and quit

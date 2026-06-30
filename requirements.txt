@@ -1,0 +1,8 @@
+# NeewerLite-Python dependencies (newest releases).
+
+# Direct Bluetooth control (GUI, --cli, --http, --list modes).
+# NOT needed when driving a neewerd daemon with --client (stdlib socket only).
+bleak>=3.0.2
+
+# GUI only. Skip for headless CLI/HTTP/--client use (PySide2 also works).
+PySide6>=6.11.1

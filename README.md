@@ -1,4 +1,12 @@
-# NeewerLite-Python
+# NeewerLite-Python (verygeeky fork)
+
+> **Fork notice.** This is a fork of [NeewerLite-Python](https://github.com/taburineagle/NeewerLite-Python)
+> by Zach Glenwright ([@taburineagle](https://github.com/taburineagle)) — itself based on the
+> [NeewerLite](https://github.com/keefo/NeewerLite) macOS Swift project by @keefo (Xu Lian). This fork
+> adds **[neewerd](https://github.com/verygeeky/neewer-lights) daemon support** (the `--client` mode;
+> see **[NEEWERD.md](NEEWERD.md)**) and aims to **extend the UI to cover all BLE opcode types**.
+> MIT-licensed, like upstream.
+
 NeewerLite-Python is an un-official cross-platform Neewer LED light control app - written in Python, originally based off of the NeewerLite macOS Swift project by @keefo (Xu Lian). NeewerLite-Python can be used on Windows, Mac and Linux, and can be used as a GUI (the normal way to use it), as a CLI (control one light from the command line), or as an HTTP server (keep persistant connections to lights active, but unlike the GUI, allow communication from remote devices like phones and Streamdecks to control single or multiple lights from a web browser!)
 
 Read the manual here: https://github.com/taburineagle/NeewerLite-Python/wiki
